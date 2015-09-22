@@ -10,6 +10,7 @@ module GSSAPI
   class Simple
 
     attr_reader :context
+    attr_reader :delegated_credentials
 
     # Initialize a new GSSAPI::Simple object
     # @param [String] host_name the fully qualified host name
@@ -26,6 +27,7 @@ module GSSAPI
       @context = nil # the security context
       @scred = nil # the service credentials.  really only used for the server-side via acquire_credentials
       set_keytab(keytab) unless keytab.nil?
+      @delegated_credentials = nil
     end
 
 
@@ -61,7 +63,7 @@ module GSSAPI
     #   to the remote host.  Otherwise it returns true and the GSS security context has been established.
     def init_context(in_token = nil, opts = {})
       min_stat = FFI::MemoryPointer.new :OM_uint32
-      ctx = (@context.nil? ? LibGSSAPI::GssCtxIdT.gss_c_no_context.address_of : @context.address_of)
+      pctx = (@context.nil? ? LibGSSAPI::GssCtxIdT.gss_c_no_context.address_of : @context.address_of)
       mech = LibGSSAPI::GssOID.gss_c_no_oid
       if(opts[:flags])
         flags = opts[:flags]
@@ -78,7 +80,7 @@ module GSSAPI
 
       maj_stat = LibGSSAPI.gss_init_sec_context(min_stat,
                                                 nil,
-                                                ctx,
+                                                pctx,
                                                 @int_svc_name,
                                                 mech,
                                                 flags,
@@ -91,8 +93,13 @@ module GSSAPI
                                                 nil)
 
       raise GssApiError.new(maj_stat, min_stat), "gss_init_sec_context did not return GSS_S_COMPLETE" if maj_stat > 1
-      
-      @context = LibGSSAPI::GssCtxIdT.new(ctx.get_pointer(0))
+
+      # The returned context may be equal to the passed in @context. If so, we
+      # must not create another AutoPointer to the same gss_buffer_t. If we do
+      # we will double delete it.
+      ctx = pctx.get_pointer(0)
+      @context = LibGSSAPI::GssCtxIdT.new(ctx) if ctx != @context
+
       maj_stat == 1 ? out_tok.value : true
     end
 
@@ -105,7 +112,7 @@ module GSSAPI
       raise GssApiError, "No credentials yet acquired. Call #{self.class.name}#acquire_credentials first" if @scred.nil?
 
       min_stat = FFI::MemoryPointer.new :OM_uint32
-      ctx = (@context.nil? ? LibGSSAPI::GssCtxIdT.gss_c_no_context.address_of : @context.address_of)
+      pctx = (@context.nil? ? LibGSSAPI::GssCtxIdT.gss_c_no_context.address_of : @context.address_of)
       no_chn_bind = LibGSSAPI::GSS_C_NO_CHANNEL_BINDINGS
       @client = FFI::MemoryPointer.new :pointer  # Will hold the initiating client name after the call
       mech = FFI::MemoryPointer.new :pointer  # Will hold the mech being used after the call
@@ -113,9 +120,10 @@ module GSSAPI
       in_tok.value = in_token
       out_tok = GSSAPI::LibGSSAPI::ManagedGssBufferDesc.new
       ret_flags = FFI::MemoryPointer.new :OM_uint32
+      delegated_cred_handle = FFI::MemoryPointer.new :pointer
 
       maj_stat = LibGSSAPI.gss_accept_sec_context(min_stat,
-                                                  ctx,
+                                                  pctx,
                                                   @scred,
                                                   in_tok.pointer,
                                                   no_chn_bind,
@@ -123,11 +131,21 @@ module GSSAPI
                                                   mech,
                                                   out_tok.pointer,
                                                   ret_flags,
-                                                  nil, nil)
+                                                  nil,
+                                                  delegated_cred_handle)
 
       raise GssApiError.new(maj_stat, min_stat), "gss_accept_sec_context did not return GSS_S_COMPLETE" if maj_stat > 1
 
-      @context = LibGSSAPI::GssCtxIdT.new(ctx.get_pointer(0))
+      if (ret_flags.read_uint32 & LibGSSAPI::GSS_C_DELEG_FLAG) != 0
+        @delegated_credentials = LibGSSAPI::GssCredIdT.new(delegated_cred_handle.get_pointer(0))
+      end
+
+      # The returned context may be equal to the passed in @context. If so, we
+      # must not create another AutoPointer to the same gss_buffer_t. If we do
+      # we will double delete it.
+      ctx = pctx.get_pointer(0)
+      @context = LibGSSAPI::GssCtxIdT.new(ctx) if ctx != @context
+
       out_tok.length > 0 ? out_tok.value : true
     end
 
